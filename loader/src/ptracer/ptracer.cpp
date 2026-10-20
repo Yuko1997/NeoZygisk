@@ -5,21 +5,28 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cinttypes>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "utils.hpp"
+#include "zygote_next_cleanup.hpp"
+
+static bool wait_for_process(int pid, int *status);
 
 /**
  * @brief Injects a shared library into a running process at its main entry point.
@@ -393,13 +400,13 @@ static bool trace_with_seize(int pid) {
         return false;
     }
 
-    int status;
 // Helper macro for local flow control
 #define BAIL_AND_DETACH                                                                            \
     ptrace(PTRACE_DETACH, pid, 0, 0);                                                              \
     return false;
 
     // Wait for the initial Seize stop
+    int status;
     if (!wait_for_process(pid, &status)) return false;
 
     // SEIZE usually stops with SIGSTOP + PTRACE_EVENT_STOP

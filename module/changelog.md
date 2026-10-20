@@ -5,6 +5,7 @@ This release adds Android 17 support and resolves injection failures across a ra
 ### 📱 Android 17
 *   **Zygote Signatures**: Added the reworked app-specialize signatures for Android 17 (`useFifoUi`, and `cgroupUid` on QPR2) and GrapheneOS 17 (relocated `extraLongArgs`); outdated signatures previously left app processes uninjected. Unresolved signatures are now logged rather than skipped silently.
 *   **ProtectedData Symbols**: Added a fallback for the `ProtectedData` (de-)constructor symbols absent on the Android 17 preview.
+*   **Native Zygote Mount Isolation**: Intercepts `zygote_next` at exec, repairs its private mount view before native isolated services can inherit it, verifies the result independently, and detaches without leaving a persistent tracer. This removes module mount artifacts from the DuckDetector ZygoteNext probe.
 
 ### 🖥 Device & Kernel Compatibility
 *   **ARMv9 BTI**: Cleared the stale `PSTATE.BTYPE` before remote calls, fixing a SIGILL on `dlopen` via ptrace on BTI-enabled hardware such as the Pixel 10 Pro XL.

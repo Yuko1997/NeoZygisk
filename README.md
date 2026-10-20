@@ -1,43 +1,101 @@
 # NeoZygisk
 
-NeoZygisk is a Zygote injection module, implemented via [`ptrace`](https://man7.org/linux/man-pages/man2/ptrace.2.html), that provides Zygisk API support for APatch and KernelSU.
-It also functions as a powerful replacement for Magisk's built-in Zygisk.
+NeoZygisk is a Zygisk implementation built on
+[`ptrace`](https://man7.org/linux/man-pages/man2/ptrace.2.html). It provides the Zygisk module API for APatch and
+KernelSU and can replace Magisk's built-in Zygisk on supported devices.
 
-## Core Principles
+## Highlights
 
-NeoZygisk is engineered with four key objectives:
+- Zygisk API compatibility with Magisk's implementation.
+- A minimal injection path with short-lived tracing and trace cleanup after module loading.
+- DenyList-aware mount isolation for applications that must not see root or module mounts.
+- Dedicated Android 17 `zygote_next` handling for native isolated services.
+- SELinux rules scoped to the operations required by each cleanup path.
 
-1.  **API Compatibility:** Maintains full API compatibility with [Magisk's built-in Zygisk](https://github.com/topjohnwu/Magisk/tree/master/native/src/core/zygisk). The relevant API designs are mirrored in the source folder [injector](https://github.com/JingMatrix/NeoZygisk/tree/master/loader/src/injector) for reference.
-2.  **Minimalist Design:** Focuses on a lean and efficient implementation of the Zygisk API, avoiding feature bloat to ensure stability and performance.
-3.  **Trace Cleaning:** Guarantees the complete removal of its injection traces from application processes once all Zygisk modules are unloaded.
-4.  **Advanced Stealth:** Employs a sophisticated DenyList to provide granular control over root and module visibility, effectively hiding the traces of your root solution.
+## How It Works
 
-## The DenyList Explained
+NeoZygisk traces the platform zygote startup path, injects modules into application processes, and removes its
+injection traces once the modules have finished loading. The same monitor also supports stub zygote chains used by some
+devices and emulators.
 
-Modern systemless root solutions operate by creating overlay filesystems using [`mount`](https://man7.org/linux/man-pages/man8/mount.8.html) rather than directly modifying system partitions. The DenyList is a core feature designed to hide these modifications by precisely controlling the [mount namespaces](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html) for each application process.
+For DenyList entries, NeoZygisk prevents the application from inheriting root and module mounts. The existing app
+zygote path is unchanged. A process marked for unmounting receives a clean mount namespace before it begins running
+application code.
 
-Here is how NeoZygisk manages visibility for different application states:
+### Android 17 Native Zygote
 
-| Application State | Mount Namespace Visibility | Description & Use Case |
-| :--- | :--- | :--- |
-| **Granted Root Privileges** | Root Solution Mounts + Module Mounts | For trusted applications that require full root access to function correctly (e.g., advanced file managers). |
-| **On DenyList** | Clean, Unmodified Mount Namespace | Provides a pristine environment for applications that perform root detection. The app's root privileges might be revoked, and all traces of root and module mounts are hidden. |
+Android 17 introduced `/system/bin/zygote_next`, which launches native isolated services without entering the Java
+zygote. NeoZygisk handles this path with a one-shot session:
 
-To achieve a clean mount namespace for applications on the DenyList, NeoZygisk employs two distinct strategies: a primary, aggressive approach and a reliable fallback.
+1. Stop `zygote_next` at its exec event before it can fork a native isolated service.
+2. Move the target into a new mount namespace and verify its namespace inode changed.
+3. Use a short-lived helper to make the mount tree private and remove records matching DuckDetector's root-marker
+   predicate.
+4. Verify the resulting mount view independently, including anchor mounts and non-marker records.
+5. Detach and confirm `TracerPid` returns to zero.
 
-1.  **Direct Zygote Unmounting (Primary Strategy)**
-    As an experimental feature for bypassing advanced detection, NeoZygisk attempts to unmount all root-related traces directly from the zygote process itself. This cleans the environment *before* an application process is fully specialized, offering a potentially more robust hiding mechanism. To ensure system stability, this operation is only performed after a strict safety check. If a module is providing critical system resources (e.g., an overlay in `/product`), this direct unmount is aborted to prevent a zygote crash.
+If cleanup cannot complete safely, NeoZygisk restores the original namespace or terminates and retries the target.
+An unavailable probe must not be treated as a clean result.
 
-2.  **Namespace Switching (Fallback Strategy)**
-    If the direct unmount strategy is aborted for safety, or if any traces failed to unmount, NeoZygisk reverts to its standard, reliable method. After an app process forks, the `setns` syscall is used to switch it into a cached, completely clean mount namespace, effectively isolating it from all system modifications.
+## DenyList
 
-## Configuration
+Use the root manager's own application setting:
 
-To configure the DenyList for a specific application, use the appropriate setting within your root management app:
+- **APatch/KernelSU:** enable **Umount modules** for the target application.
+- **Magisk:** add the application to **Configure DenyList**.
 
-*   **For APatch/KernelSU:** Enable the **`Umount modules`** option for your target application.
-*   **For Magisk:** Use the **`Configure DenyList`** menu.
+Do not enable Magisk's **Enforce DenyList** option for this module. That option enables Magisk's separate DenyList
+implementation, may conflict with NeoZygisk, and does not guarantee the same mount visibility.
 
-> **Important Note for Magisk Users**
->
-> The **`Enforce DenyList`** option in Magisk enables Magisk's *own* DenyList implementation. This is separate from NeoZygisk's functionality, is not guaranteed to hide all mount-related traces, and may conflict with NeoZygisk's hiding mechanisms. It is strongly recommended to leave this option disabled and rely solely on NeoZygisk's configuration.
+## Requirements
+
+- Android 8.0 or newer.
+- APatch, KernelSU, or Magisk at a version accepted by the module installer.
+- A supported ABI: `arm64-v8a`, `armeabi-v7a`, `x86_64`, or `x86`.
+
+Install the packaged ZIP from the root manager. Recovery-only installation is not supported.
+
+## Build
+
+The project uses the Gradle wrapper and the Android SDK/NDK versions declared in the root build files.
+
+```powershell
+.\gradlew.bat :module:zipRelease
+.\gradlew.bat :module:zipDebug
+```
+
+The module ZIPs are written to `module/build/outputs/release/`. Release builds disable ptrace file logging and
+zygote_next fault injection. Debug builds enable both.
+
+## Tests
+
+Host tests cover mountinfo parsing, the DuckDetector marker predicate, mount subtree planning, propagation checks, and
+snapshot preservation. On Windows they can be built with the Android NDK and optionally run on a connected device:
+
+```powershell
+.\loader\tests\host\build_and_run.ps1
+.\loader\tests\host\build_and_run.ps1 -Device emulator-5554
+```
+
+On Linux, the same tests can be built directly with CMake:
+
+```bash
+cmake -S loader/tests/host -B build/host-tests
+cmake --build build/host-tests
+ctest --test-dir build/host-tests --output-on-failure
+```
+
+The Android 17 mount cleanup design and verification requirements are documented in
+[docs/zygote-next-cleanup.md](docs/zygote-next-cleanup.md). Emulator startup instructions are in
+[docs/Vmdevice.md](docs/Vmdevice.md).
+
+## Project Layout
+
+- `loader/`: C++ injector, ptrace monitor, mount planning, and Android 17 native zygote cleanup.
+- `zygiskd/`: Rust daemon for module loading, process flags, and namespace management.
+- `module/`: Flashable module scripts, update metadata, and release packaging.
+- `loader/tests/host/`: Host-side differential and unit tests.
+
+## License
+
+NeoZygisk is licensed under the terms in [LICENSE](LICENSE).

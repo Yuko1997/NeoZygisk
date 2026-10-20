@@ -30,8 +30,7 @@ val defaultCFlags = arrayOf(
     "-Wall", "-Wextra",
     "-fno-rtti", "-fno-exceptions",
     "-fno-stack-protector", "-fomit-frame-pointer",
-    "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
-    "-DWORK_DIRECTORY='\"${workDirectory}\"'"
+    "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__"
 )
 
 val releaseFlags = arrayOf(
@@ -58,6 +57,7 @@ android {
         externalNativeBuild.cmake {
             cFlags("-std=c18", *defaultCFlags)
             cppFlags("-std=c++20", *defaultCFlags)
+            arguments += "-DWORK_DIRECTORY=$workDirectory"
             ccachePath?.let {
                 arguments += "-DNDK_CCACHE=$it"
             }
@@ -68,6 +68,8 @@ android {
         debug {
             externalNativeBuild.cmake {
                 arguments += "-DZKSU_VERSION=$verName-$verCode-$commitHash-debug"
+                arguments += "-DNEOZYGISK_ZYGOTE_NEXT_TESTING=ON"
+                arguments += "-DNEOZYGISK_PTRACE_INTERNAL_LOG=ON"
             }
         }
         release {

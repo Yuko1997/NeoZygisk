@@ -80,6 +80,14 @@ uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str);
 uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
                       uintptr_t return_addr, std::vector<long> &args);
 
+bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
+                         uintptr_t return_addr, std::vector<long> &args, uintptr_t *result);
+
+uintptr_t find_syscall_gadget(int pid, const std::vector<MapInfo> &info);
+
+bool remote_syscall(int pid, struct user_regs_struct &regs, long syscall_nr,
+                    const std::vector<long> &args, uintptr_t syscall_addr, uintptr_t *result);
+
 int fork_dont_care();
 
 void wait_for_trace(int pid, int *status, int flags);

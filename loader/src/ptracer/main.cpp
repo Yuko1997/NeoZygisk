@@ -73,6 +73,7 @@ static int handle_version();
  * and delegating the work to a corresponding handler function.
  */
 int main(int argc, char **argv) {
+    LOGI("ptracer process starting: pid=%d argc=%d", getpid(), argc);
     // This initialization is for the daemon's internal logic, not for CLI output.
     zygiskd::Init(kWorkDirectory);
 
@@ -83,6 +84,7 @@ int main(int argc, char **argv) {
 
     // Delegate to the appropriate handler based on the command.
     const auto command = std::string_view(argv[1]);
+    LOGI("ptracer command=%s", argv[1]);
     if (command == "monitor"sv) {
         return handle_monitor();
     } else if (command == "trace"sv) {
@@ -106,7 +108,8 @@ int main(int argc, char **argv) {
 static void print_usage(const char *tool_name) {
     fprintf(stderr, "NeoZygisk Tracer %s\n", ZKSU_VERSION);
     fprintf(stderr,
-            "usage: %s monitor | trace <pid> [--restart] | ctl <start|stop|exit> | version\n",
+            "usage: %s monitor | trace <pid> [--restart] | "
+            "ctl <start|stop|exit> | version\n",
             tool_name);
 }
 
@@ -147,8 +150,18 @@ static int handle_trace(int argc, char **argv) {
     pid_t pid = static_cast<pid_t>(pid_val);
     printf("preparing to trace PID: %d\n", pid);
 
-    // Handle optional --restart flag.
-    if (argc >= 4 && argv[3] == "--restart"sv) {
+    bool restart = false;
+    for (int i = 3; i < argc; ++i) {
+        const auto flag = std::string_view(argv[i]);
+        if (flag == "--restart"sv) {
+            restart = true;
+        } else {
+            fprintf(stderr, "error: unknown trace option '%s'\n", argv[i]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (restart) {
         printf("zygote restart requested...\n");
         zygiskd::ZygoteRestart();
     }

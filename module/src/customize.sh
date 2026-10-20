@@ -112,6 +112,33 @@ extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh'      "$MODPATH"
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
+if [ "$API" -ge 37 ]; then
+  if [ "$KSU" ]; then
+    tracer_domain=ksu
+  elif [ "$APATCH" ]; then
+    tracer_domain=su
+  else
+    tracer_domain=magisk
+  fi
+
+  cat >>"$MODPATH/sepolicy.rule" <<EOF
+# The Android 17 native zygote is seized once, before it can fork a native isolated
+# service, and its mount namespace is repaired in place. The tracer reads the
+# namespace handle and the mount view of the target itself, so no extra access to
+# another process' /proc or nsfs entries is needed here.
+allow $tracer_domain zygote_next process ptrace
+allow $tracer_domain app_zygote process ptrace
+# The rollback path opens the target's own namespace before unshare so a
+# failed cleanup can return it to the exact namespace it entered from.
+allow zygote_next unlabeled file { open read }
+allow zygote_next zygote_next capability sys_chroot
+EOF
+  if [ "$KSU" ] && ! check_sepolicy "$MODPATH/sepolicy.rule"; then
+    ui_print "! Android 17 zygote policy was rejected"
+    abort "! Unable to apply Android 17 zygote policy"
+  fi
+fi
+
 mkdir "$MODPATH/bin"
 mkdir "$MODPATH/lib"
 mkdir "$MODPATH/lib64"

@@ -1,6 +1,6 @@
 {
 	"version": "v2.4",
-	"versionCode": 289,
-	"zipUrl": "https://github.com/JingMatrix/NeoZygisk/releases/download/v2.4/NeoZygisk-v2.4-289-release.zip",
-	"changelog": "https://raw.githubusercontent.com/JingMatrix/NeoZygisk/master/module/changelog.md"
+	"versionCode": 295,
+	"zipUrl": "https://github.com/Yuko1997/NeoZygisk/releases/download/v2.4-295/NeoZygisk-v2.4-295-release.zip",
+	"changelog": "https://raw.githubusercontent.com/Yuko1997/NeoZygisk/master/module/changelog.md"
 }

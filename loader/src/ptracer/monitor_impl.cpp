@@ -1,5 +1,7 @@
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/eventpoll.h>
+#include <signal.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -7,13 +9,102 @@
 #include <unistd.h>
 
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <sstream>
+#include <string_view>
 
 #include "daemon.hpp"
 #include "files.hpp"
 #include "logging.hpp"
 #include "monitor.hpp"
 #include "utils.hpp"
+#include "zygote_next_cleanup.hpp"
+
+namespace {
+
+constexpr const char *kBootIdPath = "/proc/sys/kernel/random/boot_id";
+constexpr const char *kNativeRestartMarker =
+        "/data/local/tmp/neozygisk-zygote-next-restarted.boot";
+
+std::string read_small_text_file(const char *path) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return {};
+    char buffer[128] = {};
+    const ssize_t bytes = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (bytes <= 0) return {};
+    std::string result(buffer, static_cast<size_t>(bytes));
+    while (!result.empty() &&
+           (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) {
+        result.pop_back();
+    }
+    return result;
+}
+
+bool native_cleanup_handled_for_boot() {
+    const std::string boot_id = read_small_text_file(kBootIdPath);
+    if (boot_id.empty()) {
+        LOGE("cannot read the boot ID while checking zygote_next cleanup state");
+        return false;
+    }
+    return read_small_text_file(kNativeRestartMarker) == boot_id;
+}
+
+bool mark_native_cleanup_handled_for_boot() {
+    const std::string boot_id = read_small_text_file(kBootIdPath);
+    if (boot_id.empty()) {
+        LOGE("cannot read the boot ID after a clean zygote_next session");
+        return false;
+    }
+    const int fd = open(kNativeRestartMarker, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd == -1) {
+        PLOGE("write zygote_next cleanup marker");
+        return false;
+    }
+    const ssize_t written = write(fd, boot_id.data(), boot_id.size());
+    close(fd);
+    if (written != static_cast<ssize_t>(boot_id.size())) {
+        LOGE("could not persist the zygote_next cleanup marker");
+        return false;
+    }
+    return true;
+}
+
+bool is_native_zygote_process(pid_t pid) {
+    const std::string path = "/proc/" + std::to_string(pid) + "/exe";
+    char target[256] = {};
+    const ssize_t length = readlink(path.c_str(), target, sizeof(target) - 1);
+    if (length <= 0) return false;
+    return std::string_view(target, static_cast<size_t>(length))
+            .starts_with("/system/bin/zygote_next");
+}
+
+/// Android can start zygote_next before module post-fs-data runs. Such a
+/// process is outside the monitor's fork ancestry and can never produce an exec
+/// event. Restart it once after init is attached so the replacement is traced.
+int restart_preexisting_native_zygote() {
+    DIR *proc = opendir("/proc");
+    if (proc == nullptr) {
+        PLOGE("open /proc while checking zygote_next");
+        return 0;
+    }
+
+    int restarted = 0;
+    while (dirent *entry = readdir(proc)) {
+        char *end = nullptr;
+        const long value = strtol(entry->d_name, &end, 10);
+        if (value <= 1 || end == entry->d_name || *end != '\0') continue;
+        const pid_t pid = static_cast<pid_t>(value);
+        if (!is_native_zygote_process(pid)) continue;
+        LOGW("restarting pre-existing zygote_next PID %d so it can be intercepted", pid);
+        if (kill(pid, SIGKILL) == 0) restarted++;
+    }
+    closedir(proc);
+    return restarted;
+}
+
+}  // namespace
 
 // --- AppMonitor Method Implementations ---
 
@@ -101,11 +192,24 @@ void AppMonitor::update_status() {
 
     std::string abi_section;
     write_abi_status_section(abi_section, zygote_.get_status());
+    std::string native_section;
+    write_native_status_section(native_section);
 
-    ss << abi_section << "\n\n" << post_section_;
+    ss << abi_section << "\n" << native_section << "\n" << post_section_;
 
     std::string final_output = ss.str();
     fwrite(final_output.c_str(), 1, final_output.length(), prop_file.get());
+}
+
+void AppMonitor::write_native_status_section(std::string &status_text) {
+    if (native_zygote_status_.empty()) return;
+    status_text += "\tzygote_next:";
+    if (native_zygote_status_ == "clean") {
+        status_text += "\t😋 cleaned";
+    } else {
+        status_text += "\t❌ ";
+        status_text += native_zygote_status_;
+    }
 }
 
 bool AppMonitor::prepare_environment() {
@@ -168,6 +272,11 @@ void AppMonitor::request_exit() {
     monitor_stop_reason_ = "user requested";
     update_status();
     event_loop_.Stop();
+}
+
+void AppMonitor::set_native_zygote_status(const std::string &status) {
+    native_zygote_status_ = status;
+    update_status();
 }
 
 void AppMonitor::notify_init_detached() {
@@ -292,7 +401,13 @@ bool AppMonitor::SigChldHandler::Init() {
         PLOGE("create signalfd");
         return false;
     }
-    ptrace(PTRACE_SEIZE, 1, 0, PTRACE_O_TRACEFORK);
+    if (ptrace(PTRACE_SEIZE, 1, 0, PTRACE_O_TRACEFORK) == -1) {
+        PLOGE("seize init");
+        return false;
+    }
+    if (!native_cleanup_handled_for_boot() && restart_preexisting_native_zygote() > 0) {
+        monitor_.set_native_zygote_status("restarting pre-existing instance");
+    }
     return true;
 }
 
@@ -371,6 +486,7 @@ void AppMonitor::SigChldHandler::HandleEvent(EventLoop &, uint32_t) {
  * handler based on the process's current role in our monitoring hierarchy.
  */
 void AppMonitor::SigChldHandler::handleChildEvent(int pid, int &status) {
+    LOGV("ptrace event pid=%d status=%s", pid, parse_status(status).c_str());
     // Role 1: Process Factories (Init and Stub Zygotes)
     // These processes are monitored for PTRACE_EVENT_FORK to discover new children.
     if (pid == 1 || stub_processes_.count(pid)) {
@@ -483,9 +599,12 @@ void AppMonitor::SigChldHandler::handleNewProcess(int pid) {
  */
 void AppMonitor::SigChldHandler::handleTracedProcess(int pid, int &status) {
     bool keep_attached = false;
+    // handleExecEvent() overwrites the status while it waits for the target to
+    // stop, so the exec event has to be remembered here.
+    const bool was_exec = stopped_with(status, SIGTRAP, PTRACE_EVENT_EXEC);
 
     // The process has called execve(). We must now identify it.
-    if (stopped_with(status, SIGTRAP, PTRACE_EVENT_EXEC)) {
+    if (was_exec) {
         keep_attached = handleExecEvent(pid, status);
     }
     // The kernel auto-attaches the forked child and pauses it with PTRACE_EVENT_STOP.
@@ -510,7 +629,7 @@ void AppMonitor::SigChldHandler::handleTracedProcess(int pid, int &status) {
     if (keep_attached) {
         // If handleExecEvent promoted it to a stub or initiated injection,
         // it no longer belongs in the pre-exec candidate pool.
-        if (stopped_with(status, SIGTRAP, PTRACE_EVENT_EXEC)) {
+        if (was_exec) {
             process_.erase(pid);
         }
         return;
@@ -558,8 +677,60 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
             break;
         }
 
-        if (program != monitor_.get_abi_manager().program_path_) {
+        // Android 17's native zygote has no Java/ART hooks, so it needs a dedicated cleanup path.
+        const bool is_native_zygote = program == "/system/bin/zygote_next";
+        const bool is_app_zygote = program == monitor_.get_abi_manager().program_path_;
+        if (!is_app_zygote && !is_native_zygote) {
             break;  // Irrelevant program, exit block and return false.
+        }
+
+        // Android 17's native zygote cannot be injected into. Its mount
+        // namespace is repaired in place, while the target is stopped.
+        if (is_native_zygote) {
+            if (native_zygote_fallback_) {
+                LOGW("native zygote %d starts in recovery fallback mode", pid);
+                if (ptrace(PTRACE_DETACH, pid, 0, 0) == -1) {
+                    PLOGE("release native zygote fallback target %d", pid);
+                    kill(pid, SIGKILL);
+                }
+                monitor_.set_native_zygote_status("cleanup disabled; fallback active");
+                handled = true;
+                break;
+            }
+
+            LOGI("native zygote %d intercepted at exec; starting one-shot mount cleanup", pid);
+
+            // The monitor already owns this automatically attached tracee and
+            // has consumed the exec event. Keep the target in that ptrace stop
+            // for the whole session; detach/re-seize would create a window in
+            // which zygote_next could fork the native isolated service.
+            constexpr unsigned long kNativeOptions =
+                    PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD;
+            if (ptrace(PTRACE_SETOPTIONS, pid, 0, kNativeOptions) == -1) {
+                PLOGE("set native zygote ptrace options on %d", pid);
+                kill(pid, SIGKILL);
+                handle_native_zygote_failure();
+            } else {
+                const auto result = run_native_zygote_cleanup_session(pid);
+                if (result == native_zygote_cleanup_result::CLEAN) {
+                    native_zygote_failures_ = 0;
+                    monitor_.set_native_zygote_status("clean");
+                    if (!mark_native_cleanup_handled_for_boot()) {
+                        LOGW("native zygote: clean session completed, but the boot marker was not written");
+                    }
+                } else if (result ==
+                           native_zygote_cleanup_result::FALLBACK_TO_ORIGINAL_NAMESPACE) {
+                    native_zygote_failures_ = 0;
+                    LOGW("native zygote: cleanup failed for PID %d; original namespace restored",
+                         pid);
+                    monitor_.set_native_zygote_status("cleanup failed; namespace restored");
+                } else {
+                    LOGE("native zygote: cleanup failed for PID %d; target terminated", pid);
+                    handle_native_zygote_failure();
+                }
+            }
+            handled = true;
+            break;
         }
 
         const char *tracer = monitor_.get_abi_manager().check_and_prepare_injection();
@@ -585,10 +756,10 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
             }
 
             // Fork and execute the external injector daemon.
-            auto p = fork_dont_care();
+            const pid_t p = fork_dont_care();
             if (p == 0) {
-                execl(tracer, basename(tracer), "trace", std::to_string(pid).c_str(), "--restart",
-                      nullptr);
+                execl(tracer, basename(tracer), "trace", std::to_string(pid).c_str(),
+                      "--restart", nullptr);
                 PLOGE("execute injector daemon");
                 kill(pid, SIGKILL);
                 _exit(1);
@@ -608,4 +779,14 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
     // Ensure state transitions (like zygote_injected flags) are flushed to disk.
     monitor_.update_status();
     return handled;
+}
+
+void AppMonitor::SigChldHandler::handle_native_zygote_failure() {
+    native_zygote_failures_ += 1;
+    if (native_zygote_failures_ >= 2) {
+        native_zygote_fallback_ = true;
+        monitor_.set_native_zygote_status("cleanup failed twice; fallback armed");
+    } else {
+        monitor_.set_native_zygote_status("cleanup failed; retrying after restart");
+    }
 }

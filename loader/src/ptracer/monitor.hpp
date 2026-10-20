@@ -118,6 +118,7 @@ public:
     void request_stop(std::string reason);
     void request_exit();
     void notify_init_detached();
+    void set_native_zygote_status(const std::string &status);
 
     // Public Accessors for owned components
     ZygoteAbiManager &get_abi_manager();
@@ -165,10 +166,15 @@ private:
         int status_ = 0;
         std::set<pid_t> process_;
         std::set<pid_t> stub_processes_;
+        bool native_zygote_fallback_ = false;
+        unsigned int native_zygote_failures_ = 0;
+
+        void handle_native_zygote_failure();
     };
 
     void set_tracing_state(TracingState state);
     void write_abi_status_section(std::string &status_text, const Status &daemon_status);
+    void write_native_status_section(std::string &status_text);
 
     // Owned Components (Declaration order must match initializer list)
     EventLoop event_loop_;
@@ -182,4 +188,5 @@ private:
     std::string prop_path_;
     std::string pre_section_;
     std::string post_section_;
+    std::string native_zygote_status_;
 };

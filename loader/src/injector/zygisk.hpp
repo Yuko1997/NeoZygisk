@@ -5,18 +5,7 @@
 
 #include <string>
 
-struct mount_info {
-    unsigned int id;
-    unsigned int parent;
-    dev_t device;
-    std::string root;
-    std::string target;
-    std::string vfs_options;
-    std::string type;
-    std::string source;
-    std::string fs_options;
-    std::string raw_info;
-};
+#include "mount_info.hpp"
 
 void hook_entry(void *start_addr, size_t block_size);
 

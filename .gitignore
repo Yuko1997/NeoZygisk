@@ -1,6 +1,28 @@
-.gradle
-.idea
-.cxx
-build
+# Gradle and Android
+.gradle/
+.idea/
+*.iml
 local.properties
-Cargo.lock
+.cxx/
+**/.externalNativeBuild/
+**/build/
+captures/
+
+# Rust
+target/
+
+# Local verification and emulator artifacts
+.work/
+.emu*.log
+.emu*.err
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Locally installed test APKs
+/*.apk
+
+# OS metadata
+.DS_Store
+Thumbs.db

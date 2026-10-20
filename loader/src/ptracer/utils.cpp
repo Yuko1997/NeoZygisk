@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <elf.h>
 #include <fcntl.h>
+#include <linux/ptrace.h>
 #include <link.h>
 #include <sched.h>
 #include <sys/auxv.h>
@@ -10,16 +11,20 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
 #include <cinttypes>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ios>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -282,6 +287,262 @@ uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str) {
     return remote_addr;
 }
 
+namespace {
+
+#ifndef PTRACE_EVENT_SYSCALL
+// Bionic does not expose the syscall trace event, but the kernel reports it.
+#define PTRACE_EVENT_SYSCALL 1
+#endif
+
+/// Checks whether a wait status describes a syscall stop.
+///
+/// The x86 kernels report a syscall stop as SIGTRAP|0x80 without a ptrace
+/// event, the other architectures use the PTRACE_EVENT_SYSCALL event.
+bool is_syscall_stop(int status) {
+    if (!WIFSTOPPED(status)) return false;
+    // The signal field of a wait status is eight bits wide, the 0x80 bit marks
+    // a syscall stop on x86. WSTOPSIG() masks that bit away, so the raw field
+    // has to be used here.
+    if (((status >> 8) & 0xff) == (SIGTRAP | 0x80)) return true;
+#if defined(__aarch64__) || defined(__arm__)
+    return (status >> 16) == PTRACE_EVENT_SYSCALL;
+#else
+    return false;
+#endif
+}
+
+#if defined(__aarch64__)
+constexpr uint8_t kSyscallInstruction[] = {0x01, 0x00, 0x00, 0xd4};  // svc #0
+constexpr uintptr_t kSyscallInstructionAlignment = 4;
+#elif defined(__arm__)
+constexpr uint8_t kSyscallInstruction[] = {0x00, 0x00, 0x00, 0xef};  // svc #0
+constexpr uintptr_t kSyscallInstructionAlignment = 4;
+#elif defined(__x86_64__)
+constexpr uint8_t kSyscallInstruction[] = {0x0f, 0x05};  // syscall
+constexpr uintptr_t kSyscallInstructionAlignment = 1;
+#elif defined(__i386__)
+constexpr uint8_t kSyscallInstruction[] = {0xcd, 0x80};  // int 0x80
+constexpr uintptr_t kSyscallInstructionAlignment = 1;
+#else
+#error "Unsupported architecture for syscall injection"
+#endif
+
+uintptr_t scan_syscall_gadget(int pid, const MapInfo &map) {
+    constexpr size_t kChunkSize = 64 * 1024;
+    constexpr size_t kMaxScanSize = 2 * 1024 * 1024;
+    const size_t pattern_size = sizeof(kSyscallInstruction);
+    const uintptr_t scan_end = std::min(map.end, map.start + kMaxScanSize);
+    const uintptr_t scan_start =
+            (map.start + kSyscallInstructionAlignment - 1) & ~(kSyscallInstructionAlignment - 1);
+
+    std::vector<uint8_t> buffer(kChunkSize + pattern_size - 1);
+    for (uintptr_t addr = scan_start; addr < scan_end; addr += kChunkSize) {
+        const size_t read_size =
+                std::min(kChunkSize + pattern_size - 1, static_cast<size_t>(scan_end - addr));
+        const ssize_t bytes = read_proc(pid, addr, buffer.data(), read_size);
+        if (bytes <= 0) continue;
+
+        const auto begin = buffer.begin();
+        const auto end = begin + bytes;
+        auto search = begin;
+        while (search != end) {
+            const auto match = std::search(search, end, std::begin(kSyscallInstruction),
+                                           std::end(kSyscallInstruction));
+            if (match == end) break;
+            const uintptr_t found = addr + static_cast<uintptr_t>(std::distance(begin, match));
+            if (found % kSyscallInstructionAlignment == 0) return found;
+            search = std::next(match);
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+/// Finds a usable syscall instruction in the target.
+///
+/// The instruction has to live in an executable segment: the byte pattern also
+/// occurs in the headers of an ELF image, and jumping into those would let the
+/// target execute random data. The program headers of the mapped image are read
+/// from the target itself, so the search covers the code of the vDSO and of the
+/// C library.
+uintptr_t find_syscall_gadget(int pid, const std::vector<MapInfo> &info) {
+    for (const auto &map : info) {
+        if ((map.perms & PROT_EXEC) == 0) continue;
+        if (map.end <= map.start) continue;
+        if (map.path.find("[vdso]") != std::string::npos) {
+            const uintptr_t found = scan_syscall_gadget(pid, map);
+            if (found != 0) {
+                LOGV("find_syscall_gadget: pid=%d vdso=0x%" PRIxPTR, pid, found);
+                return found;
+            }
+        }
+
+        Elf64_Ehdr header {};
+        if (read_proc(pid, map.start, &header, sizeof(header)) != (ssize_t) sizeof(header)) continue;
+        if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0) continue;
+        if (header.e_phnum == 0 || header.e_phentsize != sizeof(Elf64_Phdr)) continue;
+        if (header.e_phoff == 0 || header.e_phoff > map.end - map.start) continue;
+
+        std::vector<Elf64_Phdr> headers(header.e_phnum);
+        const size_t table_size = headers.size() * sizeof(Elf64_Phdr);
+        const uintptr_t map_size = map.end - map.start;
+        if (table_size > map_size || header.e_phoff > map_size - table_size) continue;
+        if (read_proc(pid, map.start + header.e_phoff, headers.data(), table_size) !=
+            (ssize_t) table_size) {
+            continue;
+        }
+
+        for (const auto &phdr : headers) {
+            if (phdr.p_type != PT_LOAD || (phdr.p_flags & PF_X) == 0) continue;
+            if (phdr.p_memsz == 0 || phdr.p_vaddr > map.end - map.start) continue;
+            const uintptr_t start = map.start + phdr.p_vaddr;
+            const uintptr_t end =
+                    std::min(start + static_cast<uintptr_t>(phdr.p_memsz), map.end);
+            if (end <= start) continue;
+
+            MapInfo segment = map;
+            segment.start = start;
+            segment.end = end;
+            const uintptr_t found = scan_syscall_gadget(pid, segment);
+            if (found != 0) {
+                LOGV("find_syscall_gadget: pid=%d map=%s addr=0x%" PRIxPTR, pid,
+                     map.path.c_str(), found);
+                return found;
+            }
+        }
+    }
+    return 0;
+}
+
+bool remote_syscall(int pid, struct user_regs_struct &regs, long syscall_nr,
+                    const std::vector<long> &args, uintptr_t syscall_addr, uintptr_t *result) {
+    if (syscall_addr == 0 || result == nullptr) return false;
+
+#if defined(__x86_64__)
+    if (args.size() > 0) regs.rdi = args[0];
+    if (args.size() > 1) regs.rsi = args[1];
+    if (args.size() > 2) regs.rdx = args[2];
+    if (args.size() > 3) regs.r10 = args[3];
+    if (args.size() > 4) regs.r8 = args[4];
+    if (args.size() > 5) regs.r9 = args[5];
+    regs.REG_SYSNR = syscall_nr;
+    regs.REG_RET = syscall_nr;
+    regs.REG_IP = syscall_addr;
+#elif defined(__i386__)
+    if (args.size() > 0) regs.ebx = args[0];
+    if (args.size() > 1) regs.ecx = args[1];
+    if (args.size() > 2) regs.edx = args[2];
+    if (args.size() > 3) regs.esi = args[3];
+    if (args.size() > 4) regs.edi = args[4];
+    regs.REG_RET = syscall_nr;
+    regs.REG_IP = syscall_addr;
+#elif defined(__aarch64__)
+    for (size_t i = 0; i < args.size() && i < 8; i++) regs.regs[i] = args[i];
+    regs.REG_SYSNR = syscall_nr;
+    regs.REG_IP = syscall_addr;
+    // The gadget is jumped to directly, so the branch target identification of
+    // a previous indirect branch has to be cleared.
+    regs.pstate &= ~(3ULL << 10);
+#elif defined(__arm__)
+    for (size_t i = 0; i < args.size() && i < 7; i++) regs.uregs[i] = args[i];
+    regs.REG_SYSNR = syscall_nr;
+    regs.REG_IP = syscall_addr;
+    constexpr auto CPSR_T_MASK = 1lu << 5;
+    regs.uregs[16] &= ~CPSR_T_MASK;
+#endif
+
+    // Writing the register file of a tracee can be refused while the kernel still
+    // considers the tracee to be in the state it was seized in. The write is
+    // retried a few times before the remote syscall is given up on.
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (set_regs(pid, regs)) break;
+        if (attempt == 4) {
+            LOGE("remote_syscall: the register file of PID %d could not be written", pid);
+            return false;
+        }
+        usleep(2000);
+    }
+
+    bool entered_injected_syscall = false;
+    int status = 0;
+    int signal_to_deliver = 0;
+    for (int step = 0; step < 64; step++) {
+        if (ptrace(PTRACE_SYSCALL, pid, 0, signal_to_deliver) == -1) {
+            LOGE("remote_syscall: PTRACE_SYSCALL failed with %d: %s", errno, strerror(errno));
+            return false;
+        }
+        signal_to_deliver = 0;
+
+        // The wait is bounded: the caller is the monitor, which must not block
+        // on a target that does not report the expected stop.
+        bool stopped = false;
+        for (int attempt = 0; attempt < 2000; attempt++) {
+            const pid_t waited = waitpid(pid, &status, __WALL | WNOHANG);
+            if (waited == pid) {
+                stopped = true;
+                break;
+            }
+            if (waited == -1) {
+                if (errno == EINTR) continue;
+                PLOGE("remote_syscall: waitpid");
+                return false;
+            }
+            usleep(1000);
+        }
+        if (!stopped) {
+            LOGE("remote_syscall: PID %d did not report a stop", pid);
+            return false;
+        }
+        if (!WIFSTOPPED(status)) {
+            LOGE("remote_syscall: the tracee died during the remote syscall");
+            return false;
+        }
+        LOGV("remote_syscall: stop status=0x%x signal=0x%x event=%d", status, (status >> 8) & 0xff,
+             status >> 16);
+        if (!is_syscall_stop(status)) {
+            const int signal = WSTOPSIG(status);
+            if (WPTEVENT(status) != 0 || signal == SIGTRAP || signal == SIGSTOP) {
+                LOGE("remote_syscall: unexpected ptrace stop before syscall completion");
+                return false;
+            }
+
+            // Resume exactly once per wait result. Re-inject ordinary signals;
+            // this also lets handlers run without a second PTRACE_SYSCALL on an
+            // already-running tracee.
+            signal_to_deliver = signal;
+            continue;
+        }
+
+        struct ptrace_syscall_info info {};
+        const long info_size =
+                syscall(__NR_ptrace, PTRACE_GET_SYSCALL_INFO, pid, sizeof(info), &info);
+        if (info_size <= 0) {
+            LOGE("remote_syscall: PTRACE_GET_SYSCALL_INFO failed: %s", strerror(errno));
+            return false;
+        }
+        LOGV("remote_syscall: info op=%u arch=%u ip=0x%" PRIx64 " nr=%" PRIu64
+             " rval=%" PRId64,
+             info.op, info.arch, static_cast<uint64_t>(info.instruction_pointer),
+             info.op == PTRACE_SYSCALL_INFO_ENTRY ? static_cast<uint64_t>(info.entry.nr) : 0,
+             info.op == PTRACE_SYSCALL_INFO_EXIT ? static_cast<int64_t>(info.exit.rval) : 0);
+
+        if (info.op == PTRACE_SYSCALL_INFO_ENTRY) {
+            if (static_cast<long>(info.entry.nr) == syscall_nr) {
+                entered_injected_syscall = true;
+            }
+            continue;
+        }
+
+        if (info.op == PTRACE_SYSCALL_INFO_EXIT && entered_injected_syscall) {
+            *result = static_cast<uintptr_t>(info.exit.rval);
+            return true;
+        }
+    }
+    LOGE("remote_syscall: the injected syscall did not reach its exit stop");
+    return false;
+}
+
 /**
  * @brief Executes a function in the remote process.
  *
@@ -296,10 +557,13 @@ uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str) {
  * 6.  Waiting for the process to trap (usually via SIGSEGV at our fake return address).
  * 7.  Reading the function's return value from the appropriate register.
  *
- * @return The return value of the remote function, or 0 on failure.
+ * @return true when the remote function executed and returned to the sentinel address, with its
+ *         return value in `*result`; false when the remote call setup or trap failed.
  */
-uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
-                      uintptr_t return_addr, std::vector<long> &args) {
+bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
+                         uintptr_t return_addr, std::vector<long> &args, uintptr_t *result) {
+    if (result == nullptr) return false;
+
     align_stack(regs);
     LOGV("calling remote function 0x%" PRIxPTR " with %zu args, return to 0x%" PRIxPTR, func_addr,
          args.size(), return_addr);
@@ -318,14 +582,14 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
         if (write_proc(pid, regs.REG_SP, args.data() + 6, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for x86_64 call");
-            return 0;
+            return false;
         }
     }
     // Push return address
     regs.REG_SP -= sizeof(long);
     if (write_proc(pid, regs.REG_SP, &return_addr, sizeof(return_addr)) != sizeof(return_addr)) {
         LOGE("failed to push return address for x86_64 call");
-        return 0;
+        return false;
     }
     regs.REG_IP = func_addr;
 
@@ -338,14 +602,14 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
         if (write_proc(pid, regs.REG_SP, args.data(), stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push arguments for i386 call");
-            return 0;
+            return false;
         }
     }
     // Push return address
     regs.REG_SP -= sizeof(long);
     if (write_proc(pid, regs.REG_SP, &return_addr, sizeof(return_addr)) != sizeof(return_addr)) {
         LOGE("failed to write return addr for i386 call");
-        return 0;
+        return false;
     }
     regs.REG_IP = func_addr;
 
@@ -360,7 +624,7 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
         if (write_proc(pid, regs.REG_SP, args.data() + 8, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for aarch64 call");
-            return 0;
+            return false;
         }
     }
     regs.regs[30] = return_addr;  // Link Register (LR)
@@ -377,7 +641,7 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
         if (write_proc(pid, (uintptr_t) regs.REG_SP, args.data() + 4, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for arm call");
-            return 0;
+            return false;
         }
     }
     regs.uregs[14] = return_addr;  // Link Register (LR)
@@ -401,7 +665,7 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
 
     if (!set_regs(pid, regs)) {
         LOGE("remote_call: failed to set registers before call");
-        return 0;
+        return false;
     }
 
     ptrace(PTRACE_CONT, pid, 0, 0);
@@ -410,19 +674,27 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
 
     if (!get_regs(pid, regs)) {
         LOGE("remote_call: failed to get registers after call");
-        return 0;
+        return false;
     }
 
     // We expect the tracee to stop at our fake return address.
     if (WIFSTOPPED(status) && static_cast<uintptr_t>(regs.REG_IP) == return_addr) {
         LOGV("remote call returned, result: 0x%" PRIXPTR, (uintptr_t) regs.REG_RET);
-        return regs.REG_RET;
+        *result = regs.REG_RET;
+        return true;
     } else {
         LOGE("process stopped unexpectedly after remote call: %s at ip=0x%" PRIXPTR
              ", expected stop at 0x%" PRIXPTR,
              parse_status(status).c_str(), (uintptr_t) regs.REG_IP, return_addr);
-        return 0;
+        return false;
     }
+}
+
+uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
+                      uintptr_t return_addr, std::vector<long> &args) {
+    uintptr_t result = 0;
+    if (!remote_call_checked(pid, regs, func_addr, return_addr, args, &result)) return 0;
+    return result;
 }
 
 // --- Process Management ---

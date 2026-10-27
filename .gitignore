@@ -1,12 +1,26 @@
 # Gradle and Android
 .gradle/
 .idea/
+.kotlin/
 *.iml
 local.properties
 .cxx/
 **/.externalNativeBuild/
 **/build/
 captures/
+
+# Generated build metadata
+compile_commands.json
+CMakeUserPresets.json
+
+# Editors and local workspaces
+.vscode/
+*.code-workspace
+
+# Node tooling
+node_modules/
+coverage/
+*.tsbuildinfo
 
 # Rust
 target/
@@ -15,14 +29,21 @@ target/
 .work/
 .emu*.log
 .emu*.err
+*.log
 *.tmp
 *.bak
+*.orig
+*.rej
 *.swp
 *.swo
 
-# Locally installed test APKs
+# Locally built packages
 /*.apk
+/*.zip
+/*.aar
 
 # OS metadata
 .DS_Store
+desktop.ini
 Thumbs.db
+._*

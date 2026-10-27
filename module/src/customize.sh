@@ -112,6 +112,12 @@ extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh'      "$MODPATH"
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
+ui_print "- Extracting WebUI files"
+mkdir "$MODPATH/webroot"
+for webui_file in index.html kernelsu.js script.js style.css; do
+  extract "$ZIPFILE" "webroot/$webui_file" "$MODPATH"
+done
+
 if [ "$API" -ge 37 ]; then
   if [ "$KSU" ]; then
     tracer_domain=ksu
@@ -177,6 +183,7 @@ ui_print "- Setting permissions"
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm_recursive "$MODPATH/lib" 0 0 0755 0644 u:object_r:system_lib_file:s0
 set_perm_recursive "$MODPATH/lib64" 0 0 0755 0644 u:object_r:system_lib_file:s0
+set_perm_recursive "$MODPATH/webroot" 0 0 0755 0644
 
 # If Huawei's Maple is enabled, system_server is created with a special way which is out of Zygisk's control
 HUAWEI_MAPLE_ENABLED=$(grep_prop ro.maple.enable)

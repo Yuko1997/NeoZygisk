@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -25,7 +26,7 @@ namespace {
 
 constexpr const char *kBootIdPath = "/proc/sys/kernel/random/boot_id";
 constexpr const char *kNativeRestartMarker =
-        "/data/local/tmp/neozygisk-zygote-next-restarted.boot";
+        WORK_DIRECTORY "/neozygisk-zygote-next-restarted.boot";
 
 std::string read_small_text_file(const char *path) {
     const int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -42,19 +43,74 @@ std::string read_small_text_file(const char *path) {
     return result;
 }
 
+bool read_process_start_time(pid_t pid, unsigned long long *start_time) {
+    const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return false;
+
+    char buffer[1024] = {};
+    const ssize_t bytes = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (bytes <= 0) return false;
+
+    char *cursor = strrchr(buffer, ')');
+    if (cursor == nullptr) return false;
+    cursor += 4;  // Skip ')', the state character, and both separators.
+
+    // Fields 4..21 are numeric; field 22 is the process start time.
+    for (int field = 4; field <= 22; field++) {
+        while (*cursor == ' ') cursor++;
+        char *end = nullptr;
+        const unsigned long long value = strtoull(cursor, &end, 10);
+        if (end == cursor) return false;
+        if (field == 22) {
+            *start_time = value;
+            return true;
+        }
+        cursor = end;
+    }
+    return false;
+}
+
+bool is_native_zygote_process(pid_t pid);
+
 bool native_cleanup_handled_for_boot() {
     const std::string boot_id = read_small_text_file(kBootIdPath);
     if (boot_id.empty()) {
         LOGE("cannot read the boot ID while checking zygote_next cleanup state");
         return false;
     }
-    return read_small_text_file(kNativeRestartMarker) == boot_id;
+    const std::string marker = read_small_text_file(kNativeRestartMarker);
+    const auto first = marker.find('\n');
+    if (first == std::string::npos) return false;
+    const auto second = marker.find('\n', first + 1);
+    if (second == std::string::npos) return false;
+
+    const std::string marker_boot_id = marker.substr(0, first);
+    const std::string pid_text = marker.substr(first + 1, second - first - 1);
+    const std::string start_text = marker.substr(second + 1);
+    if (marker_boot_id != boot_id || pid_text.empty() || start_text.empty()) return false;
+
+    const long pid_value = strtol(pid_text.c_str(), nullptr, 10);
+    const unsigned long long start_value = strtoull(start_text.c_str(), nullptr, 10);
+    if (pid_value <= 1 || start_value == 0) return false;
+
+    const pid_t marker_pid = static_cast<pid_t>(pid_value);
+    if (!is_native_zygote_process(marker_pid)) return false;
+    unsigned long long current_start = 0;
+    if (!read_process_start_time(marker_pid, &current_start)) return false;
+    return current_start == start_value;
 }
 
-bool mark_native_cleanup_handled_for_boot() {
+bool mark_native_cleanup_handled_for_boot(pid_t pid) {
     const std::string boot_id = read_small_text_file(kBootIdPath);
     if (boot_id.empty()) {
         LOGE("cannot read the boot ID after a clean zygote_next session");
+        return false;
+    }
+    unsigned long long start_time = 0;
+    if (!read_process_start_time(pid, &start_time)) {
+        LOGE("cannot read the start time of native zygote PID %d", pid);
         return false;
     }
     const int fd = open(kNativeRestartMarker, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -62,9 +118,11 @@ bool mark_native_cleanup_handled_for_boot() {
         PLOGE("write zygote_next cleanup marker");
         return false;
     }
-    const ssize_t written = write(fd, boot_id.data(), boot_id.size());
+    const std::string marker =
+            boot_id + "\n" + std::to_string(pid) + "\n" + std::to_string(start_time) + "\n";
+    const ssize_t written = write(fd, marker.data(), marker.size());
     close(fd);
-    if (written != static_cast<ssize_t>(boot_id.size())) {
+    if (written != static_cast<ssize_t>(marker.size())) {
         LOGE("could not persist the zygote_next cleanup marker");
         return false;
     }
@@ -126,47 +184,8 @@ TracingState AppMonitor::get_tracing_state() const { return tracing_state_; }
 
 void AppMonitor::set_tracing_state(TracingState state) { tracing_state_ = state; }
 
-void AppMonitor::write_abi_status_section(std::string &status_text, const Status &daemon_status) {
-    auto abi_name = this->zygote_.abi_name_;
-    if (daemon_status.supported) {
-        status_text += "\tzygote";
-        status_text += abi_name;
-        status_text += ":";
-        if (tracing_state_ != TRACING)
-            status_text += "\t❓ unknown";
-        else if (daemon_status.zygote_injected)
-            status_text += "\t😋 injected";
-        else
-            status_text += "\t❌ not injected";
-        status_text += "\n\tdaemon";
-        status_text += abi_name;
-        status_text += ":";
-        if (daemon_status.daemon_running) {
-            status_text += "\t😋 running";
-            if (!daemon_status.daemon_info.empty()) {
-                status_text += "\n";
-                status_text += daemon_status.daemon_info;
-            }
-        } else {
-            status_text += "\t❌ crashed";
-            if (!daemon_status.daemon_error_info.empty()) {
-                status_text += "(";
-                status_text += daemon_status.daemon_error_info;
-                status_text += ")";
-            }
-        }
-    }
-}
-
-void AppMonitor::update_status() {
-    auto prop_file = xopen_file(prop_path_.c_str(), "w");
-    if (!prop_file) {
-        PLOGE("open module.prop");
-        return;
-    }
-
-    // Build the middle section of the status text.
-    std::string status_text = "\tmonitor: \t";
+void AppMonitor::write_monitor_status_section(std::string &status_text) {
+    status_text += "\tmonitor: \t";
     switch (tracing_state_) {
     case TRACING:
         status_text += "😋 tracing";
@@ -185,20 +204,82 @@ void AppMonitor::update_status() {
         status_text += monitor_stop_reason_;
         status_text += ")";
     }
+}
+
+void AppMonitor::write_abi_status_section(std::string &status_text, const Status &daemon_status,
+                                          bool include_daemon_info) {
+    auto abi_name = this->zygote_.abi_name_;
+    if (daemon_status.supported) {
+        status_text += "\tzygote";
+        status_text += abi_name;
+        status_text += ":";
+        if (tracing_state_ != TRACING)
+            status_text += "\t❓ unknown";
+        else if (daemon_status.zygote_injected)
+            status_text += "\t😋 injected";
+        else
+            status_text += "\t❌ not injected";
+        status_text += "\n\tdaemon";
+        status_text += abi_name;
+        status_text += ":";
+        if (daemon_status.daemon_running) {
+            status_text += "\t😋 running";
+            if (include_daemon_info && !daemon_status.daemon_info.empty()) {
+                status_text += "\n";
+                status_text += daemon_status.daemon_info;
+            }
+        } else {
+            status_text += "\t❌ crashed";
+            if (include_daemon_info && !daemon_status.daemon_error_info.empty()) {
+                status_text += "(";
+                status_text += daemon_status.daemon_error_info;
+                status_text += ")";
+            }
+        }
+    }
+}
+
+void AppMonitor::update_status() {
+    auto prop_file = xopen_file(prop_path_.c_str(), "w");
+    if (!prop_file) {
+        PLOGE("open module.prop");
+        return;
+    }
+
+    const auto daemon_status = zygote_.get_status();
+
+    // module.prop is a human-readable action view and includes daemon details.
+    std::string display_status;
+    write_monitor_status_section(display_status);
+    std::string display_abi;
+    write_abi_status_section(display_abi, daemon_status, true);
 
     // Build the full content in a single stringstream for clarity.
     std::stringstream ss;
-    ss << pre_section_ << "\n" << status_text << "\n\n";
+    ss << pre_section_ << "\n" << display_status << "\n\n";
+    ss << display_abi << "\n";
+    std::string display_native;
+    write_native_status_section(display_native);
+    ss << display_native << "\n" << post_section_;
 
-    std::string abi_section;
-    write_abi_status_section(abi_section, zygote_.get_status());
-    std::string native_section;
-    write_native_status_section(native_section);
-
-    ss << abi_section << "\n" << native_section << "\n" << post_section_;
-
-    std::string final_output = ss.str();
+    const std::string final_output = ss.str();
     fwrite(final_output.c_str(), 1, final_output.length(), prop_file.get());
+
+    // The WebUI consumes only this file, so module-controlled text from the
+    // daemon info blob can never be interpreted as an authoritative status key.
+    auto status_file = xopen_file(status_path_.c_str(), "w");
+    if (!status_file) {
+        PLOGE("open status");
+        return;
+    }
+    std::string authoritative_status;
+    write_monitor_status_section(authoritative_status);
+    authoritative_status += "\n";
+    write_abi_status_section(authoritative_status, daemon_status, false);
+    authoritative_status += "\n";
+    write_native_status_section(authoritative_status);
+    authoritative_status += "\n";
+    fwrite(authoritative_status.c_str(), 1, authoritative_status.length(), status_file.get());
 }
 
 void AppMonitor::write_native_status_section(std::string &status_text) {
@@ -214,7 +295,9 @@ void AppMonitor::write_native_status_section(std::string &status_text) {
 
 bool AppMonitor::prepare_environment() {
     prop_path_ = zygiskd::GetTmpPath() + "/module.prop";
+    status_path_ = zygiskd::GetTmpPath() + "/status";
     close(open(prop_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    close(open(status_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
     auto orig_prop = xopen_file("./module.prop", "r");
     if (orig_prop == nullptr) {
         PLOGE("open original prop");
@@ -715,7 +798,7 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
                 if (result == native_zygote_cleanup_result::CLEAN) {
                     native_zygote_failures_ = 0;
                     monitor_.set_native_zygote_status("clean");
-                    if (!mark_native_cleanup_handled_for_boot()) {
+                    if (!mark_native_cleanup_handled_for_boot(pid)) {
                         LOGW("native zygote: clean session completed, but the boot marker was not written");
                     }
                 } else if (result ==

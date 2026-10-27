@@ -173,7 +173,9 @@ private:
     };
 
     void set_tracing_state(TracingState state);
-    void write_abi_status_section(std::string &status_text, const Status &daemon_status);
+    void write_monitor_status_section(std::string &status_text);
+    void write_abi_status_section(std::string &status_text, const Status &daemon_status,
+                                  bool include_daemon_info);
     void write_native_status_section(std::string &status_text);
 
     // Owned Components (Declaration order must match initializer list)
@@ -186,6 +188,7 @@ private:
     TracingState tracing_state_;
     std::string monitor_stop_reason_;
     std::string prop_path_;
+    std::string status_path_;
     std::string pre_section_;
     std::string post_section_;
     std::string native_zygote_status_;

@@ -4,6 +4,16 @@
 
 本文只讨论 Android 17 的 `/system/bin/zygote_next` 清理，不改变 Java zygote、DenyList、已授权 root 以及缓存命名空间的现有路径。
 
+App Profile DenyList 继续由 root manager 的 UID 查询决定：Java app 进程通过
+`uid_should_umount` 得到 `non_root_profile.umount_modules`/`allow_su` 的结果。`zygote_next`
+承载的是 isolated native service，KernelSU 对它本身始终执行 unmount，因此这里保留父进程的
+一次性清理；清理标记额外记录 PID 和 `/proc/<pid>/stat` 的 starttime，避免同一 boot 内
+`zygote_next` 重启后被旧标记误判为已处理。
+
+WebUI 的权威状态单独写入 `/data/adb/neozygisk/status`，不解析 `module.prop` 中由
+`DAEMON_SET_INFO` 拼接的模块名和 daemon 展示文本。这样即使模块名包含 `monitor:` 或
+`zygote_next:` 等前缀，也只能作为展示内容出现，不能覆盖监控器写入的状态。
+
 检测基准固定为 DuckDetector 提交
 [`d3a085e3eaedeb160eda0566e43c3535675a190b`](https://github.com/eltavine/Duck-Detector-Refactoring/tree/d3a085e3eaedeb160eda0566e43c3535675a190b)，
 即工作区中的 `Duck Detector-2026.10.19-d3a085e3eaed.apk` 对应的源码。后续讨论不再使用“Magisk 通常会怎样”“overlay 通常会怎样”之类推测作为验收规则。

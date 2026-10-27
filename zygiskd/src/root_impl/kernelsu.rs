@@ -256,7 +256,10 @@ pub fn uid_granted_root(uid: i32) -> bool {
 }
 
 /// Checks if a UID is on the unmount list in KernelSU.
-/// This is a high-level dispatcher function.
+///
+/// The KernelSU ioctl is authoritative for AppProfile: it applies
+/// `allow_su`, `non_root_profile.use_default`, and
+/// `non_root_profile.umount_modules`. Do not replace it with a global UID list.
 pub fn uid_should_umount(uid: i32) -> bool {
     match KSU_RESULT.get().and_then(|opt| opt.as_ref()) {
         Some(result) => match result.method {

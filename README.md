@@ -55,6 +55,13 @@ implementation, may conflict with NeoZygisk, and does not guarantee the same mou
 
 Install the packaged ZIP from the root manager. Recovery-only installation is not supported.
 
+## WebUI
+
+KernelSU and APatch can open the module WebUI directly from the module page. It shows the
+current injector and Android 17 native zygote status, active Zygisk modules, and device details.
+Status is read from the monitor-owned `/data/adb/neozygisk/status` file; module metadata and
+daemon display text remain in the human-readable `module.prop` view.
+
 ## Build
 
 The project uses the Gradle wrapper and the Android SDK/NDK versions declared in the root build files.

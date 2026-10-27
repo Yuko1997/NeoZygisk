@@ -50,6 +50,9 @@ jobs:
         with:
           key: ${{ github.job }}-${{ runner.os }}-${{ hashFiles('**/build.gradle.kts') }}
 
+      - name: Test WebUI
+        run: node --test module/tests/webroot.test.js
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:

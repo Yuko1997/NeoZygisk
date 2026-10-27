@@ -365,6 +365,9 @@ fn handle_get_process_flags(stream: &mut UnixStream) -> Result<()> {
         if root_impl::uid_granted_root(uid) {
             flags |= ProcessFlags::PROCESS_GRANTED_ROOT;
         }
+        // KernelSU resolves UID_SHOULD_UMOUNT through AppProfile, including
+        // non_root_profile.umount_modules and allow_su. Keep this query rather
+        // than reconstructing a global denylist from package state.
         if root_impl::uid_should_umount(uid) {
             flags |= ProcessFlags::PROCESS_ON_DENYLIST;
         }

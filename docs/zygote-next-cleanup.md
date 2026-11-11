@@ -10,7 +10,7 @@ App Profile DenyList 继续由 root manager 的 UID 查询决定：Java app 进�
 一次性清理；清理标记额外记录 PID 和 `/proc/<pid>/stat` 的 starttime，避免同一 boot 内
 `zygote_next` 重启后被旧标记误判为已处理。
 
-WebUI 的权威状态单独写入 `/data/adb/neozygisk/status`，不解析 `module.prop` 中由
+WebUI 的权威状态单独写入 `/data/system/neozygisk/status`，不解析 `module.prop` 中由
 `DAEMON_SET_INFO` 拼接的模块名和 daemon 展示文本。这样即使模块名包含 `monitor:` 或
 `zygote_next:` 等前缀，也只能作为展示内容出现，不能覆盖监控器写入的状态。
 

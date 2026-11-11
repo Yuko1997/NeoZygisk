@@ -56,7 +56,11 @@ function loadScript(name) {
     window,
   };
   vm.createContext(context);
-  vm.runInContext(fs.readFileSync(path.join(WEBROOT, name), "utf8"), context);
+  const source = fs
+    .readFileSync(path.join(WEBROOT, name), "utf8")
+    .replaceAll("@WORK_DIRECTORY@", "/data/system/neozygisk")
+    .replaceAll("@MODULE_ID@", "zygisksu");
+  vm.runInContext(source, context);
   return { context, timers, window };
 }
 
@@ -98,6 +102,36 @@ test("authoritative status is independent of module display text", () => {
   assert.equal(snapshot.status.zygote_next, "cleanup failed");
   assert.equal(snapshot.prop.version, "v2.4");
   assert.equal(context.overallTone(snapshot.status), "down");
+});
+
+test("a zygote that needs restart is a warning, not unknown", () => {
+  const { context } = loadScript("script.js");
+  const status = context.parseStatusProp(
+    "\tmonitor: \t😋 tracing\n" +
+      "\tzygote64:\t⚠️ needs restart\n" +
+      "\tdaemon64:\t😋 running\n",
+  );
+  assert.equal(status.zygote64, "needs restart");
+  assert.equal(context.overallTone(status), "warn");
+});
+
+test("a pending reboot is surfaced as a warning", () => {
+  const { context } = loadScript("script.js");
+  const status = context.parseStatusProp(
+    "\tmonitor: \t😋 tracing\n" +
+      "\tzygote64:\t😋 injected\n" +
+      "\tdaemon64:\t😋 running\n" +
+      "\tpending_reboot:\t⚠️ reboot required\n",
+  );
+  assert.equal(status.pending_reboot, "reboot required");
+  assert.equal(context.overallTone(status), "warn");
+});
+
+test("status command uses the configured work directory and module id", () => {
+  const { context } = loadScript("script.js");
+  const command = context.unifiedStatusCommand();
+  assert.match(command, /\/data\/adb\/modules\/zygisksu\/bin\/zygisk-ptrace64/);
+  assert.match(command, /\/data\/system\/neozygisk\/status/);
 });
 
 test("callback bridge is invoked exactly once", async () => {

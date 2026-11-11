@@ -67,6 +67,7 @@ android {
     buildTypes {
         debug {
             externalNativeBuild.cmake {
+                cppFlags += "-DZYGISK_DEBUG"
                 arguments += "-DZKSU_VERSION=$verName-$verCode-$commitHash-debug"
                 arguments += "-DNEOZYGISK_ZYGOTE_NEXT_TESTING=ON"
                 arguments += "-DNEOZYGISK_PTRACE_INTERNAL_LOG=ON"

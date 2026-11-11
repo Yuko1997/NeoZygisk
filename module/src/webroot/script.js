@@ -1,5 +1,10 @@
-const PROP_PATH = "/data/adb/neozygisk/module.prop";
-const STATUS_PATH = "/data/adb/neozygisk/status";
+const WORK_DIR = "@WORK_DIRECTORY@";
+const MODULE_ID = "@MODULE_ID@";
+const LEGACY_WORK_DIR = "/data/adb/neozygisk";
+const PROP_PATH = `${WORK_DIR}/module.prop`;
+const STATUS_PATH = `${WORK_DIR}/status`;
+const LEGACY_PROP_PATH = `${LEGACY_WORK_DIR}/module.prop`;
+const LEGACY_STATUS_PATH = `${LEGACY_WORK_DIR}/status`;
 const MODULE_MARKER = "@@NZMOD@@ ";
 const LANG_STORAGE_KEY = "neozygisk.lang";
 
@@ -14,6 +19,7 @@ const STATUS_KEYS = new Set([
   "daemon32",
   "daemon64",
   "zygote_next",
+  "pending_reboot",
 ]);
 
 const I18N = {
@@ -55,6 +61,7 @@ const I18N = {
     reloaded: "Reloaded",
     load_failed: "Failed to read module status",
     bridge_missing: "No supported WebUI bridge detected",
+    reboot_required_hint: "The last hot install did not finish; reboot to activate the new version.",
     denylist: "DenyList / App Profile",
     denylist_hint: "NeoZygisk reads the root manager's per-app unmount policy. Set App Profile or Configure DenyList on the apps that must not see root or module mounts.",
   },
@@ -96,6 +103,7 @@ const I18N = {
     reloaded: "已重新整理",
     load_failed: "讀取模組狀態失敗",
     bridge_missing: "找不到支援的 WebUI bridge",
+    reboot_required_hint: "上次熱更新未完成，請重新開機以啟用新版本。",
     denylist: "DenyList / App Profile",
     denylist_hint: "NeoZygisk 讀取 Root 管理器的按應用卸載策略。請在 App Profile 或 DenyList 設定不應看到 Root/模組掛載的應用。",
   },
@@ -137,6 +145,7 @@ const I18N = {
     reloaded: "已刷新",
     load_failed: "读取模块状态失败",
     bridge_missing: "找不到支持的 WebUI bridge",
+    reboot_required_hint: "上次热更新未完成，请重启以启用新版本。",
     denylist: "DenyList / App Profile",
     denylist_hint: "NeoZygisk 读取 Root 管理器的按应用卸载策略。请在 App Profile 或 DenyList 中配置不应看到 Root/模块挂载的应用。",
   },
@@ -288,10 +297,20 @@ function parseSectionOutput(stdout) {
 function unifiedStatusCommand() {
   return [
     "dump_all() {",
+    `  tracer=/data/adb/modules/${MODULE_ID}/bin/zygisk-ptrace64`,
+    `  [ -x "$tracer" ] || tracer=/data/adb/modules/${MODULE_ID}/bin/zygisk-ptrace32`,
     '  echo "---PROP---"',
-    `  base64 < ${PROP_PATH} 2>/dev/null`,
+    '  if [ -x "$tracer" ]; then',
+    '    "$tracer" status 2>/dev/null',
+    "  else",
+    `    f=${PROP_PATH}; [ -r "$f" ] || f=${LEGACY_PROP_PATH}; cat "$f" 2>/dev/null`,
+    "  fi | base64",
     '  echo "---STATUS---"',
-    `  base64 < ${STATUS_PATH} 2>/dev/null`,
+    '  if [ -x "$tracer" ]; then',
+    '    "$tracer" status --raw 2>/dev/null',
+    "  else",
+    `    f=${STATUS_PATH}; [ -r "$f" ] || f=${LEGACY_STATUS_PATH}; cat "$f" 2>/dev/null`,
+    "  fi | base64",
     '  echo "---ROOT---"',
     "  {",
     '    r="Unknown"',
@@ -344,6 +363,8 @@ function normalizeStatus(raw) {
   const value = String(raw || "").toLowerCase();
   if (!value) return "unknown";
   if (value.includes("not injected")) return "not_injected";
+  if (value.includes("needs restart")) return "unclean";
+  if (value.includes("reboot required")) return "unclean";
   if (value.includes("cleanup failed") || value.includes("fallback") || value.includes("restarting")) {
     return "unclean";
   }
@@ -372,9 +393,13 @@ function overallTone(status) {
   const zygote = normalizeStatus(status.zygote64 || status.zygote32 || status.zygote);
   const daemon = normalizeStatus(status.daemon64 || status.daemon32 || status.daemon);
   const next = status.zygote_next ? normalizeStatus(status.zygote_next) : null;
+  const pending = status.pending_reboot ? normalizeStatus(status.pending_reboot) : null;
 
   if (BAD_STATUSES.has(monitor) || BAD_STATUSES.has(zygote)) return "down";
-  if (BAD_STATUSES.has(daemon) || next === "unclean") return "warn";
+  if (BAD_STATUSES.has(daemon) ||
+      [monitor, zygote, daemon, next, pending].includes("unclean")) {
+    return "warn";
+  }
   if ([monitor, zygote, daemon].every((value) => GOOD_STATUSES.has(value)) &&
       (!next || next === "clean")) {
     return "ok";
@@ -386,7 +411,8 @@ function renderHero(tone) {
   const classes = { ok: "tone-ok", warn: "tone-warn", down: "tone-down", unknown: "tone-neutral" };
   $("hero").className = `hero ${classes[tone]}`;
   $("hero-title").textContent = t(`status_${tone}`);
-  $("hero-sub").textContent = t(`status_${tone}_hint`);
+  const pendingReboot = snapshot && snapshot.status && snapshot.status.pending_reboot;
+  $("hero-sub").textContent = pendingReboot ? t("reboot_required_hint") : t(`status_${tone}_hint`);
 }
 
 function normalizeRootName(name) {

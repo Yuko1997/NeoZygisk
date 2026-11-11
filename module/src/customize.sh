@@ -5,8 +5,10 @@ DEBUG=@DEBUG@
 MIN_APATCH_VERSION=@MIN_APATCH_VERSION@
 MIN_KSU_VERSION=@MIN_KSU_VERSION@
 MIN_KSUD_VERSION=@MIN_KSUD_VERSION@
-MAX_KSU_VERSION=@MAX_KSU_VERSION@
+# KernelSU added MODULE_HOT_INSTALL_REQUEST in commit 200818c, versionCode 32683.
+MIN_KSUD_HOT_INSTALL_VERSION=32683
 MIN_MAGISK_VERSION=@MIN_MAGISK_VERSION@
+WORK_DIRECTORY=@WORK_DIRECTORY@
 
 if [ "$BOOTMODE" ] && [ "$APATCH" ]; then
   ui_print "- Installing from APatch app"
@@ -16,7 +18,7 @@ if [ "$BOOTMODE" ] && [ "$APATCH" ]; then
     ui_print "! Please update APatch to latest version"
     abort    "*********************************************************"
   fi
-  if [ "$(which magisk)" ]; then
+  if command -v magisk >/dev/null 2>&1; then
     ui_print "*********************************************************"
     ui_print "! Multiple root implementation is NOT supported!"
     ui_print "! Please uninstall Magisk before installing NeoZygisk"
@@ -30,11 +32,6 @@ elif [ "$BOOTMODE" ] && [ "$KSU" ]; then
     ui_print "! KernelSU version is too old!"
     ui_print "! Please update KernelSU to latest version"
     abort    "*********************************************************"
-  elif [ "$KSU_KERNEL_VER_CODE" -ge "$MAX_KSU_VERSION" ]; then
-    ui_print "*********************************************************"
-    ui_print "! KernelSU version too large!"
-    ui_print "! Support for KernelSU (variant) could be incomplete"
-    ui_print "*********************************************************"
   fi
   if ! [ "$KSU_VER_CODE" ] || [ "$KSU_VER_CODE" -lt "$MIN_KSUD_VERSION" ]; then
     ui_print "*********************************************************"
@@ -42,7 +39,7 @@ elif [ "$BOOTMODE" ] && [ "$KSU" ]; then
     ui_print "! Please update KernelSU Manager to latest version"
     abort    "*********************************************************"
   fi
-  if [ "$(which magisk)" ]; then
+  if command -v magisk >/dev/null 2>&1; then
     ui_print "*********************************************************"
     ui_print "! Multiple root implementation is NOT supported!"
     ui_print "! Please uninstall Magisk before installing NeoZygisk"
@@ -98,18 +95,20 @@ if [ "$KSU" ]; then
   ui_print "- Checking SELinux patches"
   if ! check_sepolicy "$TMPDIR/sepolicy.rule"; then
     ui_print "*********************************************************"
-    ui_print "! Unable to apply SELinux patches!"
-    ui_print "! Your kernel may not support SELinux patch fully"
+    ui_print "! ksud rejected our SELinux rules!"
+    ui_print "! Please report this along with your ksud version"
     abort    "*********************************************************"
   fi
 fi
 
 ui_print "- Extracting module files"
-extract "$ZIPFILE" 'action.sh'     "$MODPATH"
+extract "$ZIPFILE" 'action.sh'       "$MODPATH"
 extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
+extract "$ZIPFILE" 'late-load.sh'    "$MODPATH"
+extract "$ZIPFILE" 'hotinstall.sh'   "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
-extract "$ZIPFILE" 'uninstall.sh'      "$MODPATH"
+extract "$ZIPFILE" 'uninstall.sh'    "$MODPATH"
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
 ui_print "- Extracting WebUI files"
@@ -127,15 +126,18 @@ if [ "$API" -ge 37 ]; then
     tracer_domain=magisk
   fi
 
+  # The Android 17 native zygote is seized once, before it can fork a native isolated
+  # service, and its mount namespace is repaired in place. The tracer reads the namespace
+  # handle and the mount view of the target itself, so no extra access to another process'
+  # /proc or nsfs entries is needed here. The rollback path opens the target's own
+  # namespace before unshare so a failed cleanup can return it to the exact namespace it
+  # entered from.
+  #
+  # Only rules go into sepolicy.rule: some ksud versions treat a '#' line as a malformed
+  # statement and abort the install.
   cat >>"$MODPATH/sepolicy.rule" <<EOF
-# The Android 17 native zygote is seized once, before it can fork a native isolated
-# service, and its mount namespace is repaired in place. The tracer reads the
-# namespace handle and the mount view of the target itself, so no extra access to
-# another process' /proc or nsfs entries is needed here.
 allow $tracer_domain zygote_next process ptrace
 allow $tracer_domain app_zygote process ptrace
-# The rollback path opens the target's own namespace before unshare so a
-# failed cleanup can return it to the exact namespace it entered from.
 allow zygote_next unlabeled file { open read }
 allow zygote_next zygote_next capability sys_chroot
 EOF
@@ -185,9 +187,28 @@ set_perm_recursive "$MODPATH/lib" 0 0 0755 0644 u:object_r:system_lib_file:s0
 set_perm_recursive "$MODPATH/lib64" 0 0 0755 0644 u:object_r:system_lib_file:s0
 set_perm_recursive "$MODPATH/webroot" 0 0 0755 0644
 
+# The one script meant to be run by hand; the rest are sourced or started by a manager.
+set_perm "$MODPATH/late-load.sh" 0 0 0755
+
 # If Huawei's Maple is enabled, system_server is created with a special way which is out of Zygisk's control
 HUAWEI_MAPLE_ENABLED=$(grep_prop ro.maple.enable)
 if [ "$HUAWEI_MAPLE_ENABLED" == "1" ]; then
   ui_print "- Add ro.maple.enable=0"
   echo "ro.maple.enable=0" >>"$MODPATH/system.prop"
+fi
+
+# Hot install can only replace a monitor that is already running. A fresh install has no
+# monitor, and a monitor from the old work directory cannot be reached through the new
+# path, so both cases must take the reboot instead of starting a monitor that cannot seize
+# init. The Maple workaround above also needs the reboot because KSU's hot-install path
+# loads no system.prop.
+if [ "$KSU" ] && [ "$KSU_VER_CODE" -ge "$MIN_KSUD_HOT_INSTALL_VERSION" ] &&
+  [ ! -f "$MODPATH/system.prop" ] &&
+  [ -S "$WORK_DIRECTORY/init_monitor" ] &&
+  grep -q 'TracerPid:[[:space:]]*[1-9]' /proc/1/status; then
+  ui_print "- Applying with a zygote restart (no full reboot)"
+  export MODULE_HOT_INSTALL_REQUEST=true
+  export MODULE_HOT_RUN_SCRIPT=hotinstall.sh
+else
+  ui_print "- Reboot required to start NeoZygisk"
 fi

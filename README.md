@@ -59,8 +59,13 @@ Install the packaged ZIP from the root manager. Recovery-only installation is no
 
 KernelSU and APatch can open the module WebUI directly from the module page. It shows the
 current injector and Android 17 native zygote status, active Zygisk modules, and device details.
-Status is read from the monitor-owned `/data/adb/neozygisk/status` file; module metadata and
+Status is read from the monitor-owned `/data/system/neozygisk/status` file; module metadata and
 daemon display text remain in the human-readable `module.prop` view.
+
+If a hot install cannot make the new monitor live, `status --raw` reports `pending_reboot` until
+a successful monitor start clears it.
+A successful hot install restarts zygote (not a full reboot) so the new monitor's daemon and
+injector take effect immediately.
 
 ## Build
 

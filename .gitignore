@@ -47,3 +47,4 @@ target/
 desktop.ini
 Thumbs.db
 ._*
+zygiskd/target/

@@ -1,8 +1,11 @@
 #include "utils.hpp"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <elf.h>
 #include <fcntl.h>
+#include <libgen.h>
+#include <limits.h>
 #include <linux/ptrace.h>
 #include <link.h>
 #include <sched.h>
@@ -25,10 +28,12 @@
 #include <cstring>
 #include <ios>
 #include <iterator>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 
 /**
@@ -557,13 +562,13 @@ bool remote_syscall(int pid, struct user_regs_struct &regs, long syscall_nr,
  * 6.  Waiting for the process to trap (usually via SIGSEGV at our fake return address).
  * 7.  Reading the function's return value from the appropriate register.
  *
- * @return true when the remote function executed and returned to the sentinel address, with its
- *         return value in `*result`; false when the remote call setup or trap failed.
+ * @return The return value of the remote function, or 0 on failure. A function returning
+ * zero is indistinguishable from a failure by value alone, so a caller that needs to tell
+ * them apart passes `ok`.
  */
-bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
-                         uintptr_t return_addr, std::vector<long> &args, uintptr_t *result) {
-    if (result == nullptr) return false;
-
+uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
+                      uintptr_t return_addr, std::vector<long> &args, bool *ok) {
+    if (ok) *ok = false;
     align_stack(regs);
     LOGV("calling remote function 0x%" PRIxPTR " with %zu args, return to 0x%" PRIxPTR, func_addr,
          args.size(), return_addr);
@@ -582,14 +587,14 @@ bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_
         if (write_proc(pid, regs.REG_SP, args.data() + 6, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for x86_64 call");
-            return false;
+            return 0;
         }
     }
     // Push return address
     regs.REG_SP -= sizeof(long);
     if (write_proc(pid, regs.REG_SP, &return_addr, sizeof(return_addr)) != sizeof(return_addr)) {
         LOGE("failed to push return address for x86_64 call");
-        return false;
+        return 0;
     }
     regs.REG_IP = func_addr;
 
@@ -602,14 +607,14 @@ bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_
         if (write_proc(pid, regs.REG_SP, args.data(), stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push arguments for i386 call");
-            return false;
+            return 0;
         }
     }
     // Push return address
     regs.REG_SP -= sizeof(long);
     if (write_proc(pid, regs.REG_SP, &return_addr, sizeof(return_addr)) != sizeof(return_addr)) {
         LOGE("failed to write return addr for i386 call");
-        return false;
+        return 0;
     }
     regs.REG_IP = func_addr;
 
@@ -624,7 +629,7 @@ bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_
         if (write_proc(pid, regs.REG_SP, args.data() + 8, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for aarch64 call");
-            return false;
+            return 0;
         }
     }
     regs.regs[30] = return_addr;  // Link Register (LR)
@@ -641,7 +646,7 @@ bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_
         if (write_proc(pid, (uintptr_t) regs.REG_SP, args.data() + 4, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for arm call");
-            return false;
+            return 0;
         }
     }
     regs.uregs[14] = return_addr;  // Link Register (LR)
@@ -665,7 +670,7 @@ bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_
 
     if (!set_regs(pid, regs)) {
         LOGE("remote_call: failed to set registers before call");
-        return false;
+        return 0;
     }
 
     ptrace(PTRACE_CONT, pid, 0, 0);
@@ -674,27 +679,29 @@ bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_
 
     if (!get_regs(pid, regs)) {
         LOGE("remote_call: failed to get registers after call");
-        return false;
+        return 0;
     }
 
     // We expect the tracee to stop at our fake return address.
     if (WIFSTOPPED(status) && static_cast<uintptr_t>(regs.REG_IP) == return_addr) {
         LOGV("remote call returned, result: 0x%" PRIXPTR, (uintptr_t) regs.REG_RET);
-        *result = regs.REG_RET;
-        return true;
+        if (ok) *ok = true;
+        return regs.REG_RET;
     } else {
         LOGE("process stopped unexpectedly after remote call: %s at ip=0x%" PRIXPTR
              ", expected stop at 0x%" PRIXPTR,
              parse_status(status).c_str(), (uintptr_t) regs.REG_IP, return_addr);
-        return false;
+        return 0;
     }
 }
 
-uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
-                      uintptr_t return_addr, std::vector<long> &args) {
-    uintptr_t result = 0;
-    if (!remote_call_checked(pid, regs, func_addr, return_addr, args, &result)) return 0;
-    return result;
+bool remote_call_checked(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
+                         uintptr_t return_addr, std::vector<long> &args, uintptr_t *result) {
+    bool ok = false;
+    const uintptr_t value = remote_call(pid, regs, func_addr, return_addr, args, &ok);
+    if (!ok) return false;
+    if (result != nullptr) *result = value;
+    return true;
 }
 
 // --- Process Management ---
@@ -751,25 +758,9 @@ int fork_dont_care() {
     return 0;
 }
 
-/**
- * @brief Skips the currently trapped syscall for a tracee.
- *
- * When a tracee is stopped due to a PTRACE_EVENT_SECCOMP, it is paused *before*
- * the syscall is executed. This function prevents the syscall from ever running
- * by modifying the tracee's registers.
- *
- * It sets the syscall number register to -1, which is an invalid syscall number.
- * The kernel recognizes this and skips the execution, causing the syscall to
- * immediately return with -ENOSYS, without any side effects.
- *
- * For ARM/ARM64, it also uses architecture-specific ptrace requests as a
- * fallback/alternative method to ensure the syscall is skipped. These might not
-alway
-s
- * work on all kernel versions, so their errors are ignored.
- *
- * @param pid The process ID of the tracee.
- */
+// Clears the syscall number at an event stop, which makes the kernel skip the call and answer
+// -ENOSYS. On arm and arm64 the number does not live in the general-purpose register set, so
+// the architecture requests follow; they fail on some kernels, hence the ignored errors.
 void tracee_skip_syscall(int pid) {
     user_regs_struct regs;
     if (!get_regs(pid, regs)) {
@@ -777,8 +768,6 @@ void tracee_skip_syscall(int pid) {
         exit(1);
     }
 
-    // Set the syscall number to an invalid value (-1).
-    // The kernel will see this and skip the syscall execution.
     regs.REG_SYSNR = -1;
 
     if (!set_regs(pid, regs)) {
@@ -786,10 +775,6 @@ void tracee_skip_syscall(int pid) {
         exit(1);
     }
 
-    // For ARM architectures, there are specific ptrace requests to modify the
-    // syscall number. We attempt these as well, but don't check for errors
-    // as they may not be supported on all kernels. The register modification
-    // above is the primary method.
 #if defined(__aarch64__)
     int sysnr = -1;
     struct iovec iov = {.iov_base = &sysnr, .iov_len = sizeof(sysnr)};
@@ -799,40 +784,31 @@ void tracee_skip_syscall(int pid) {
 #endif
 }
 
-/**
- * @brief Waits for a ptrace event, handling seccomp events specifically.
- *
- * This is a wrapper around waitpid that handles EINTR and automatically
- * continues the process after a PTRACE_EVENT_SECCOMP.
- *
- * @param pid The PID to wait for.
- * @param status A pointer to an integer where the status will be stored.
- * @param flags Flags for waitpid.
- */
+// waitpid, retried over EINTR, with the injector's own seccomp event answered in place: its
+// syscall is skipped and the tracee resumed, so callers only ever see a stop they asked for.
 void wait_for_trace(int pid, int *status, int flags) {
     while (true) {
         if (waitpid(pid, status, flags) == -1) {
             if (errno == EINTR) {
-                continue;  // Interrupted by a signal, just retry.
+                continue;
             }
             PLOGE("waitpid(%d)", pid);
             exit(1);
         }
 
-        // Check if the stop was caused by a PTRACE_EVENT_SECCOMP.
+        // The event itself is the point: raising it overwrote ptrace_message with zero.
         if (*status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8))) {
+            LOGV("seccomp event on pid %d cleared its ptrace event message", pid);
             tracee_skip_syscall(pid);
             ptrace(PTRACE_CONT, pid, 0, 0);
-            continue;  // Continue waiting for the next *real* stop event.
+            continue;
         }
 
-        // If the process terminated or signaled instead of stopping, it's an error.
         if (!WIFSTOPPED(*status)) {
             LOGE("process %d did not stop as expected: %s", pid, parse_status(*status).c_str());
             exit(1);
         }
 
-        // It's a valid stop event that we need to handle, so we return.
         return;
     }
 }
@@ -872,4 +848,196 @@ std::string get_program(int pid) {
     }
     buf[sz] = 0;
     return buf;
+}
+
+/**
+ * @brief Returns the module directory, resolved once from /proc/self/exe
+ *        ($MODDIR/bin/zygisk-ptrace64 -> $MODDIR).
+ *
+ * Nothing the monitor needs may be named relative to the working directory. A hot install
+ * renames the live module directory into ksud's trash, so a monitor that inherited it keeps
+ * resolving to the retired copy until the next boot deletes it; the late-load entry point is
+ * a root shell, whose working directory is wherever the user happened to be. Pinned on first
+ * use so the answer stays the path the running binary was started from.
+ */
+const std::string &get_module_dir() {
+    static const std::string dir = [] {
+        char exe_path[PATH_MAX];
+        auto len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (len == -1) {
+            PLOGE("readlink /proc/self/exe");
+            return std::string(".");
+        }
+        exe_path[len] = '\0';
+        // .../bin/zygisk-ptrace64 -> .../bin -> $MODDIR. Nesting is safe: bionic's dirname()
+        // returns a buffer it owns and accepts one back as input.
+        return std::string(dirname(dirname(exe_path)));
+    }();
+    return dir;
+}
+
+/**
+ * @brief Reads /proc/[pid]/comm, without the trailing newline.
+ */
+std::string get_comm(pid_t pid) {
+    std::string path = "/proc/" + std::to_string(pid) + "/comm";
+    auto file = std::unique_ptr<FILE, decltype(&fclose)>(fopen(path.c_str(), "re"), &fclose);
+    if (file == nullptr) return "";
+
+    char buf[64];
+    if (fgets(buf, sizeof(buf), file.get()) == nullptr) return "";
+
+    std::string comm(buf);
+    while (!comm.empty() && (comm.back() == '\n' || comm.back() == '\0')) {
+        comm.pop_back();
+    }
+    return comm;
+}
+
+/**
+ * @brief Reads /proc/[pid]/cmdline as the argument vector it stores.
+ */
+std::vector<std::string> read_cmdline(pid_t pid) {
+    std::vector<std::string> argv;
+    std::string path = "/proc/" + std::to_string(pid) + "/cmdline";
+    auto file = std::unique_ptr<FILE, decltype(&fclose)>(fopen(path.c_str(), "re"), &fclose);
+    if (file == nullptr) return argv;
+
+    // The arguments are NUL-separated. A process that rewrote argv[0] with a shorter name
+    // leaves the rest of the original block zeroed, so empty entries are dropped rather
+    // than reported as arguments.
+    std::string arg;
+    int ch;
+    while ((ch = fgetc(file.get())) != EOF) {
+        if (ch == '\0') {
+            if (!arg.empty()) argv.push_back(arg);
+            arg.clear();
+        } else {
+            arg.push_back(static_cast<char>(ch));
+        }
+    }
+    if (!arg.empty()) argv.push_back(arg);
+    return argv;
+}
+
+/**
+ * @brief Reads the parent pid from /proc/[pid]/status.
+ *
+ * Parsed from status rather than stat, whose second field is a parenthesised comm that may
+ * itself contain spaces and parentheses and so cannot be field-split safely.
+ */
+pid_t get_ppid(pid_t pid) {
+    std::string path = "/proc/" + std::to_string(pid) + "/status";
+    auto file = std::unique_ptr<FILE, decltype(&fclose)>(fopen(path.c_str(), "re"), &fclose);
+    if (file == nullptr) return -1;
+
+    char line[256];
+    while (fgets(line, sizeof(line), file.get()) != nullptr) {
+        int ppid = -1;
+        if (sscanf(line, "PPid: %d", &ppid) == 1) return ppid;
+    }
+    return -1;
+}
+
+/**
+ * @brief Finds every live process whose /proc/[pid]/exe resolves to the given path.
+ */
+std::vector<pid_t> find_processes_by_exe(std::string_view exe) {
+    std::vector<pid_t> found;
+
+    auto dir = std::unique_ptr<DIR, decltype(&closedir)>(opendir("/proc"), &closedir);
+    if (dir == nullptr) {
+        PLOGE("opendir /proc");
+        return found;
+    }
+
+    while (auto *entry = readdir(dir.get())) {
+        char *end_ptr = nullptr;
+        errno = 0;
+        long value = strtol(entry->d_name, &end_ptr, 10);
+        if (*end_ptr != '\0' || errno != 0 || value <= 0) continue;
+        auto pid = static_cast<pid_t>(value);
+
+        // Read the link directly instead of going through get_program(), which logs on
+        // every failure. Most /proc entries here are processes we cannot or need not
+        // inspect, so a failure is the normal case and not worth reporting.
+        std::string path = "/proc/" + std::string(entry->d_name) + "/exe";
+        char buf[PATH_MAX];
+        auto len = readlink(path.c_str(), buf, sizeof(buf) - 1);
+        if (len == -1) continue;
+        buf[len] = '\0';
+
+        if (exe == buf) found.push_back(pid);
+    }
+
+    return found;
+}
+
+/**
+ * @brief Tests whether a library whose path contains the given suffix is mapped into a process.
+ */
+bool has_library_mapped(pid_t pid, std::string_view suffix) {
+    for (const auto &info : MapInfo::Scan(std::to_string(pid))) {
+        if (info.path.find(suffix) != std::string::npos) return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Reads the tracer pid from /proc/[pid]/status.
+ */
+char get_process_state(pid_t pid) {
+    std::string path = "/proc/" + std::to_string(pid) + "/status";
+    auto file = std::unique_ptr<FILE, decltype(&fclose)>(fopen(path.c_str(), "re"), &fclose);
+    if (file == nullptr) return '\0';
+
+    char line[256];
+    while (fgets(line, sizeof(line), file.get()) != nullptr) {
+        char state = '\0';
+        if (sscanf(line, "State: %c", &state) == 1) return state;
+    }
+    return '\0';
+}
+
+pid_t get_tracer_pid(pid_t pid) {
+    std::string path = "/proc/" + std::to_string(pid) + "/status";
+    auto file = std::unique_ptr<FILE, decltype(&fclose)>(fopen(path.c_str(), "re"), &fclose);
+    if (file == nullptr) return -1;
+
+    char line[256];
+    while (fgets(line, sizeof(line), file.get()) != nullptr) {
+        int tracer = -1;
+        if (sscanf(line, "TracerPid: %d", &tracer) == 1) return tracer;
+    }
+    return -1;
+}
+
+/**
+ * @brief Tests whether argv says a process is a zygote.
+ */
+bool has_zygote_cmdline(pid_t pid) {
+    auto argv = read_cmdline(pid);
+    if (argv.empty()) return false;
+
+    std::string_view name = argv.front();
+    if (auto slash = name.rfind('/'); slash != std::string_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    if (name.starts_with("zygote")) return true;
+
+    for (const auto &arg : argv) {
+        if (arg == "--zygote") return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Finds every running zygote of this build's own ABI.
+ */
+std::vector<pid_t> find_zygotes() {
+    std::vector<pid_t> found;
+    for (auto pid : find_processes_by_exe(kZygoteProgram)) {
+        if (get_ppid(pid) == 1 && has_zygote_cmdline(pid)) found.push_back(pid);
+    }
+    return found;
 }

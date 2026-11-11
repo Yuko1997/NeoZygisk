@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 23)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(WORK_DIRECTORY "/data/adb/neozygisk" CACHE STRING "NeoZygisk working directory")
+set(WORK_DIRECTORY "/data/system/neozygisk" CACHE STRING "NeoZygisk working directory")
 option(NEOZYGISK_ZYGOTE_NEXT_TESTING "Enable debug-only zygote_next fault injection" OFF)
 option(NEOZYGISK_PTRACE_INTERNAL_LOG "Enable debug-only ptrace file logging" OFF)
 

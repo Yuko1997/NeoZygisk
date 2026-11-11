@@ -11,6 +11,8 @@ KernelSU and can replace Magisk's built-in Zygisk on supported devices.
 - DenyList-aware mount isolation for applications that must not see root or module mounts.
 - Dedicated Android 17 `zygote_next` handling for native isolated services.
 - SELinux rules scoped to the operations required by each cleanup path.
+- A KernelSU/APatch WebUI for injector, daemon, module, and device status.
+- Hot module updates that restart zygote, or a clear `pending_reboot` fallback when they cannot complete.
 
 ## How It Works
 
@@ -21,6 +23,10 @@ devices and emulators.
 For DenyList entries, NeoZygisk prevents the application from inheriting root and module mounts. The existing app
 zygote path is unchanged. A process marked for unmounting receives a clean mount namespace before it begins running
 application code.
+
+The monitor forks one `zygiskd` daemon per active ABI. The daemon owns the module snapshot and the module companion
+processes, and it is bound to the monitor's lifetime. A hot update therefore replaces the monitor and restarts zygote
+so the new daemon and injector take over together.
 
 ### Android 17 Native Zygote
 
@@ -55,17 +61,61 @@ implementation, may conflict with NeoZygisk, and does not guarantee the same mou
 
 Install the packaged ZIP from the root manager. Recovery-only installation is not supported.
 
+## Updating
+
+Install the new ZIP from the root manager as usual. KernelSU can hot-install when all of these are true:
+
+- `ksud` is version 32683 or newer.
+- A live monitor owns `/data/system/neozygisk/init_monitor`.
+- Init is still traced by that monitor.
+- The module did not write `system.prop`.
+
+On that path NeoZygisk replaces the module directory, stops the old monitor, starts a new monitor, and restarts
+zygote. The restart recreates running applications, but it does not reboot the device; the new daemon and injector
+take effect immediately.
+
+A fresh install, a monitor from the legacy `/data/adb/neozygisk` directory, an older `ksud`, or a failed handoff
+falls back to `Reboot required`. If the handoff starts but cannot finish, `status --raw` reports `pending_reboot`
+until a successful monitor start clears it.
+
 ## WebUI
 
 KernelSU and APatch can open the module WebUI directly from the module page. It shows the
 current injector and Android 17 native zygote status, active Zygisk modules, and device details.
-Status is read from the monitor-owned `/data/system/neozygisk/status` file; module metadata and
-daemon display text remain in the human-readable `module.prop` view.
+Status is read through the tracer from the monitor-owned `/data/system/neozygisk/status` file, so
+the WebUI does not depend on the shell being able to read that directory directly. Module metadata
+and daemon display text remain in the human-readable `module.prop` view.
 
 If a hot install cannot make the new monitor live, `status --raw` reports `pending_reboot` until
 a successful monitor start clears it.
+
 A successful hot install restarts zygote (not a full reboot) so the new monitor's daemon and
 injector take effect immediately.
+
+## Troubleshooting
+
+If a module update succeeds but Zygisk modules are not loading, check the status first:
+
+```text
+monitor:     tracing
+zygote64:    injected
+daemon64:    running
+zygote_next: cleaned
+```
+
+The `daemon64` line is the important one. A state with only `monitor: tracing` means the monitor
+is armed but the running zygote has not been replaced yet, so no `zygiskd` daemon is serving new
+processes. Reboot, or reinstall a build that restarts zygote after a hot install.
+
+Also check:
+
+```bash
+ps -A | grep -E 'zygisk-ptrace64|zygiskd'
+logcat -d | grep -E 'Failed to receive client FD|system service is not ready'
+```
+
+If `status --raw` contains `pending_reboot`, the last hot install did not finish; reboot to
+activate the installed version.
 
 ## Build
 
@@ -87,6 +137,7 @@ snapshot preservation. On Windows they can be built with the Android NDK and opt
 ```powershell
 .\loader\tests\host\build_and_run.ps1
 .\loader\tests\host\build_and_run.ps1 -Device emulator-5554
+node --test module/tests/webroot.test.js
 ```
 
 On Linux, the same tests can be built directly with CMake:

@@ -49,6 +49,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: ${{ github.job }}-${{ runner.os }}-${{ hashFiles('**/build.gradle.kts') }}
+          # ubuntu-latest no longer ships ccache; refresh the package index
+          # so the action can install it instead of failing with apt exit 100.
+          update-package-index: true
 
       - name: Test WebUI
         run: node --test module/tests/webroot.test.js

@@ -46,12 +46,12 @@ jobs:
         run: cargo install cargo-ndk --locked
 
       - name: Setup Ccache for faster builds
-        uses: hendrikmuhs/ccache-action@v1
+        uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: ${{ github.job }}-${{ runner.os }}-${{ hashFiles('**/build.gradle.kts') }}
-          # ubuntu-latest no longer ships ccache; refresh the package index
-          # so the action can install it instead of failing with apt exit 100.
-          update-package-index: true
+          # ubuntu-latest no longer ships ccache, and its apt index is stale.
+          # Install the prebuilt binary instead of going through apt.
+          install: binary
 
       - name: Test WebUI
         run: node --test module/tests/webroot.test.js

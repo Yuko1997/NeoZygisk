@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
   push:
@@ -109,3 +112,47 @@ jobs:
         with:
           name: debug-symbols
           path: zygiskd/build/symbols/debug/
+
+      - name: Upload Release ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-zip
+          path: module/build/outputs/release/NeoZygisk-v*-release.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download release ZIP
+        uses: actions/download-artifact@v7
+        with:
+          name: release-zip
+          path: dist
+
+      - name: Prepare release assets
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          ZIP=$(find dist -type f -name 'NeoZygisk-*-release.zip')
+          mv "$ZIP" "dist/NeoZygisk-${TAG}-release.zip"
+          cd dist
+          sha256sum "NeoZygisk-${TAG}-release.zip" > "NeoZygisk-${TAG}-release.zip.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            "dist/NeoZygisk-${TAG}-release.zip" \
+            "dist/NeoZygisk-${TAG}-release.zip.sha256" \
+            --title "NeoZygisk ${TAG}" \
+            --notes-file module/changelog.md
